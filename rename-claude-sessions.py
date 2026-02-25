@@ -29,9 +29,12 @@ Usage:
     rename-claude-sessions --force      # include active sessions (skip idle check)
     rename-claude-sessions --cleanup    # delete sessions with no real user messages
     rename-claude-sessions --max-age-days 5  # skip sessions older than 5 days (default)
-    rename-claude-sessions --title-provider ollama --ollama-model qwen2.5-coder:1.5b
+    rename-claude-sessions --title-provider ollama --ollama-model qwen2.5-coder:1.5b  # default
+    rename-claude-sessions --title-provider gemini  # uses Gemini API (needs GEMINI_API_KEY in .env)
     rename-claude-sessions --title-provider claude --claude-model claude-3-5-haiku-latest
-    rename-claude-sessions --file PATH [--force-title "Title"]  # single file; --force-title forces that title (to test mtime preservation when no strategy matches)
+    rename-claude-sessions --file PATH [--force-title "Title"]  # single file; --force-title forces that title
+    rename-claude-sessions --session-id UUID --force-title "Title"  # find session by ID across all projects
+    rename-claude-sessions --current --force-title "Title"  # rename the most recently modified session
 
 Install as cron (every 30 minutes):
     crontab -e
@@ -44,6 +47,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -55,6 +60,10 @@ CLAUDE_EXCERPT_MAX_CHARS = 3000
 TITLE_TIMEOUT = 45
 DEFAULT_CLAUDE_MODEL = "claude-3-5-haiku-latest"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:1.5b"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# .env file location: next to the script (follows symlinks)
+_SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
 _monorepo_cache: Dict[str, bool] = {}
 
 # Regex for GitHub issue/PR URLs
@@ -391,10 +400,19 @@ def set_custom_title(filepath: Path, session_id: str, title: str, index_data: Op
         if atime is not None and mtime is not None:
             os.utime(filepath, (atime, mtime))
         if index_data and "entries" in index_data:
+            found = False
             for entry in index_data["entries"]:
                 if entry.get("sessionId") == session_id:
                     entry["customTitle"] = title
+                    found = True
                     break
+            if not found:
+                # Create a minimal index entry so claude --resume shows the title
+                index_data["entries"].append({
+                    "sessionId": session_id,
+                    "fullPath": str(filepath),
+                    "customTitle": title,
+                })
         return True
     except OSError as e:
         print(f"  ERROR writing {filepath}: {e}", file=sys.stderr)
@@ -534,6 +552,67 @@ def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> Optional
     return None
 
 
+def _load_env_var(name: str) -> Optional[str]:
+    """Load a variable from the .env file next to the script, or from the environment."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    env_path = _SCRIPT_DIR / ".env"
+    if env_path.is_file():
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == name:
+                        return v.strip()
+        except OSError:
+            pass
+    return None
+
+
+def generate_title_via_gemini(meta: dict, verbose: bool, model: str) -> Optional[str]:
+    """Use the Gemini REST API to generate a short title from the first few messages."""
+    api_key = _load_env_var("GEMINI_API_KEY")
+    if not api_key:
+        if verbose:
+            print("    (gemini: no GEMINI_API_KEY found in .env or environment)")
+        return None
+
+    prompt = _title_prompt_from_meta(meta)
+    if not prompt:
+        return None
+
+    url = GEMINI_API_URL.format(model=model) + f"?key={api_key}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.3},
+    }).encode()
+
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=TITLE_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode())
+        # For thinking models (e.g. gemini-2.5-flash), skip thought parts
+        parts = body["candidates"][0]["content"]["parts"]
+        text = None
+        for part in reversed(parts):
+            if part.get("thought"):
+                continue
+            if "text" in part:
+                text = part["text"]
+                break
+        if not text:
+            text = parts[-1].get("text", "")
+        return _clean_model_title(text)
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, IndexError, json.JSONDecodeError, OSError) as e:
+        if verbose:
+            print(f"    (gemini: {e})")
+    return None
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     verbose = "--verbose" in sys.argv
@@ -542,6 +621,7 @@ def main():
     title_provider = "ollama"
     claude_model = DEFAULT_CLAUDE_MODEL
     ollama_model = DEFAULT_OLLAMA_MODEL
+    gemini_model = DEFAULT_GEMINI_MODEL
     max_age_days = DEFAULT_MAX_AGE_DAYS
     single_file: Optional[Path] = None
     force_title: Optional[str] = None
@@ -549,8 +629,8 @@ def main():
         i = sys.argv.index("--title-provider")
         if i + 1 < len(sys.argv):
             title_provider = sys.argv[i + 1].lower()
-        if title_provider not in {"ollama", "claude", "auto"}:
-            print("Usage: --title-provider must be one of: ollama, claude, auto", file=sys.stderr)
+        if title_provider not in {"gemini", "ollama", "claude", "auto"}:
+            print("Usage: --title-provider must be one of: gemini, ollama, claude, auto", file=sys.stderr)
             sys.exit(1)
     if "--claude-model" in sys.argv:
         i = sys.argv.index("--claude-model")
@@ -565,6 +645,13 @@ def main():
             ollama_model = sys.argv[i + 1]
         if not ollama_model:
             print("Usage: --ollama-model <model-name>", file=sys.stderr)
+            sys.exit(1)
+    if "--gemini-model" in sys.argv:
+        i = sys.argv.index("--gemini-model")
+        if i + 1 < len(sys.argv):
+            gemini_model = sys.argv[i + 1]
+        if not gemini_model:
+            print("Usage: --gemini-model <model-name>", file=sys.stderr)
             sys.exit(1)
     if "--max-age-days" in sys.argv:
         i = sys.argv.index("--max-age-days")
@@ -590,6 +677,48 @@ def main():
             if not force_title:
                 print("Usage: rename-claude-sessions --file <path> --force-title \"Your title\"", file=sys.stderr)
                 sys.exit(1)
+    if "--session-id" in sys.argv:
+        i = sys.argv.index("--session-id")
+        sid = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        if not sid:
+            print("Usage: --session-id <UUID>", file=sys.stderr)
+            sys.exit(1)
+        # Find the JSONL file matching this session ID
+        for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
+            candidate = project_dir / f"{sid}.jsonl"
+            if candidate.is_file():
+                single_file = candidate
+                break
+        if not single_file:
+            print(f"Session {sid} not found in {CLAUDE_PROJECTS_DIR}", file=sys.stderr)
+            sys.exit(1)
+        if "--force-title" in sys.argv:
+            j = sys.argv.index("--force-title")
+            if j + 1 < len(sys.argv):
+                force_title = sys.argv[j + 1]
+    if "--current" in sys.argv:
+        # Find the most recently modified JSONL (the active session)
+        newest: Optional[Path] = None
+        newest_mtime: float = 0.0
+        for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
+            if not project_dir.is_dir():
+                continue
+            for f in project_dir.glob("*.jsonl"):
+                try:
+                    mt = f.stat().st_mtime
+                    if mt > newest_mtime:
+                        newest_mtime = mt
+                        newest = f
+                except OSError:
+                    continue
+        if not newest:
+            print(f"No session files found in {CLAUDE_PROJECTS_DIR}", file=sys.stderr)
+            sys.exit(1)
+        single_file = newest
+        if "--force-title" in sys.argv:
+            j = sys.argv.index("--force-title")
+            if j + 1 < len(sys.argv):
+                force_title = sys.argv[j + 1]
 
     if not single_file and not CLAUDE_PROJECTS_DIR.is_dir():
         print(f"No Claude projects directory at {CLAUDE_PROJECTS_DIR}")
@@ -635,12 +764,16 @@ def main():
 
         new_title = force_title if force_title else resolve_title(meta, repo_cache, title_cache, pr_cache, verbose)
         if not new_title:
-            if title_provider == "ollama":
+            if title_provider == "gemini":
+                new_title = generate_title_via_gemini(meta, verbose, gemini_model)
+            elif title_provider == "ollama":
                 new_title = generate_title_via_ollama(meta, verbose, ollama_model)
             elif title_provider == "claude":
                 new_title = generate_title_via_claude(meta, verbose, claude_model)
-            else:
-                new_title = generate_title_via_ollama(meta, verbose, ollama_model)
+            else:  # auto: try gemini → ollama → claude
+                new_title = generate_title_via_gemini(meta, verbose, gemini_model)
+                if not new_title:
+                    new_title = generate_title_via_ollama(meta, verbose, ollama_model)
                 if not new_title:
                     new_title = generate_title_via_claude(meta, verbose, claude_model)
         if not new_title:
@@ -652,7 +785,9 @@ def main():
             return
 
         if dry_run or verbose:
+            first = (meta.get("firstText") or "(empty)")[:80]
             print(f"  RENAME: {new_title}")
+            print(f"          was: {first}")
         if verbose:
             print(f"          branch: {meta.get('branch', '(none)')} | {session_file.name}")
 
@@ -680,7 +815,12 @@ def main():
             print(f"  FAILED: {session_file.name}", file=sys.stderr)
 
     if single_file:
-        process(single_file)
+        project_dir = single_file.parent
+        index_data = load_sessions_index(project_dir)
+        index_modified_ref: List[bool] = [False]
+        process(single_file, index_data, index_modified_ref)
+        if index_modified_ref[0] and index_data and not dry_run:
+            save_sessions_index(project_dir, index_data)
     else:
         now = time.time()
         max_age_seconds = max_age_days * 86400
