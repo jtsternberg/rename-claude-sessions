@@ -14,6 +14,9 @@ All notable changes since the first version (credit: @fernandoduro).
 - **Single-file mode** — `--file PATH` processes one session file; `--force-title "Title"` forces that title (useful for testing mtime preservation).
 - **Age filter** — `--max-age-days N` (default: 5) skips sessions older than N days; use `0` to disable. Summary line reports “Too old” count.
 - **README** — Install, requirements, usage, and option reference.
+- **sessions-index.json** (credit: @fernandoduro) — When setting a title, the script updates the project’s `sessions-index.json` so Ctrl+R shows the new title without reopening. If a session already has a custom title but the index doesn’t, the script syncs the index.
+- **--force** (credit: @fernandoduro) — Include active sessions (skip the 300s idle check).
+- **--cleanup** (credit: @fernandoduro) — Delete sessions with no real user messages (only IDE tags, etc.) and remove them from the index. Summary line reports “Deleted” / “Would delete” when used.
 
 ### Changed
 

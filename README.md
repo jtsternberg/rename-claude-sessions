@@ -8,7 +8,7 @@ It tries strategies in this order:
 3. PR inferred from branch name
 4. LLM fallback (`ollama`, `claude`, or `auto`)
 
-The script appends a `custom-title` JSONL record and restores file `mtime/atime` so session ordering is preserved.
+The script appends a `custom-title` JSONL record and restores file `mtime/atime` so session ordering is preserved. It also updates each project’s `sessions-index.json` so Ctrl+R shows the new title without reopening.
 
 ## Requirements
 
@@ -84,11 +84,26 @@ python3 rename-claude-sessions.py \
   --ollama-model qwen2.5-coder:1.5b
 ```
 
+Include active sessions (skip idle check):
+
+```bash
+python3 rename-claude-sessions.py --force --dry-run
+```
+
+Preview then delete empty sessions (no real user messages):
+
+```bash
+python3 rename-claude-sessions.py --cleanup --dry-run   # preview
+python3 rename-claude-sessions.py --cleanup             # run for real
+```
+
 Useful flags:
 - `--title-provider ollama|claude|auto`
 - `--ollama-model <model>` — must be one shown by `ollama list`
 - `--claude-model <model>` — must be one of: `haiku`, `sonnet`, or `opus`
 - `--max-age-days <N>` (default: `5`; `0` disables age limit)
+- `--force` — include active sessions (skip the 300s idle check)
+- `--cleanup` — delete sessions with no real user messages and remove them from the index (use `--dry-run` first to preview)
 
 ## Cron setup
 
