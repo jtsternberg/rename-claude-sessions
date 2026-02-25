@@ -65,6 +65,9 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 # .env file location: next to the script (follows symlinks)
 _SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
 _monorepo_cache: Dict[str, bool] = {}
+# Track consecutive Gemini failures to bail early on rate limits
+_gemini_consecutive_failures = 0
+GEMINI_MAX_CONSECUTIVE_FAILURES = 3
 
 # Regex for GitHub issue/PR URLs
 GH_URL_RE = re.compile(
@@ -575,6 +578,12 @@ def _load_env_var(name: str) -> Optional[str]:
 
 def generate_title_via_gemini(meta: dict, verbose: bool, model: str) -> Optional[str]:
     """Use the Gemini REST API to generate a short title from the first few messages."""
+    global _gemini_consecutive_failures
+    if _gemini_consecutive_failures >= GEMINI_MAX_CONSECUTIVE_FAILURES:
+        if verbose:
+            print("    (gemini: skipping — too many consecutive failures)")
+        return None
+
     api_key = _load_env_var("GEMINI_API_KEY")
     if not api_key:
         if verbose:
@@ -606,8 +615,14 @@ def generate_title_via_gemini(meta: dict, verbose: bool, model: str) -> Optional
                 break
         if not text:
             text = parts[-1].get("text", "")
-        return _clean_model_title(text)
+        title = _clean_model_title(text)
+        if title:
+            _gemini_consecutive_failures = 0
+        else:
+            _gemini_consecutive_failures += 1
+        return title
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, IndexError, json.JSONDecodeError, OSError) as e:
+        _gemini_consecutive_failures += 1
         if verbose:
             print(f"    (gemini: {e})")
     return None
