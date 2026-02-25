@@ -27,6 +27,7 @@ Usage:
     rename-claude-sessions --dry-run    # preview changes only
     rename-claude-sessions --verbose    # show all decisions
     rename-claude-sessions --force      # include active sessions (skip idle check)
+    rename-claude-sessions --cleanup    # delete sessions with no real user messages
     rename-claude-sessions --max-age-days 5  # skip sessions older than 5 days (default)
     rename-claude-sessions --title-provider ollama --ollama-model qwen2.5-coder:1.5b
     rename-claude-sessions --title-provider claude --claude-model claude-3-5-haiku-latest
@@ -310,6 +311,42 @@ def read_session_metadata(filepath: Path) -> dict | None:
     }
 
 
+def is_empty_session(filepath: Path) -> bool:
+    """True if the session has no real user messages (only IDE tags, system messages, etc.)."""
+    try:
+        with open(filepath) as f:
+            for i, line in enumerate(f):
+                if i > 30:
+                    return False
+                try:
+                    d = json.loads(line)
+                    if d.get("type") == "user":
+                        msg = d.get("message", {})
+                        if isinstance(msg, str) and msg.strip():
+                            return False
+                        if isinstance(msg, dict):
+                            content = msg.get("content", [])
+                            if isinstance(content, str) and content.strip():
+                                return False
+                            if isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "text":
+                                        text = c.get("text", "")
+                                        if text and not text.startswith("<ide_opened_file>") and not text.startswith("<ide_selection>"):
+                                            return False
+                    elif d.get("type") == "assistant":
+                        msg = d.get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", [])
+                            if isinstance(content, list) and len(content) > 0:
+                                return False
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return False
+    return True
+
+
 def load_sessions_index(project_dir: Path) -> dict | None:
     """Load sessions-index.json for a project directory."""
     index_path = project_dir / "sessions-index.json"
@@ -500,6 +537,7 @@ def main():
     dry_run = "--dry-run" in sys.argv
     verbose = "--verbose" in sys.argv
     force = "--force" in sys.argv
+    cleanup = "--cleanup" in sys.argv
     title_provider = "ollama"
     claude_model = DEFAULT_CLAUDE_MODEL
     ollama_model = DEFAULT_OLLAMA_MODEL
@@ -560,6 +598,7 @@ def main():
     title_cache: dict = {}
     pr_cache: dict = {}
     renamed = 0
+    cleaned = 0
     skipped_has_title = 0
     skipped_no_match = 0
     skipped_empty = 0
@@ -665,6 +704,25 @@ def main():
                     if verbose:
                         print(f"  SKIP (old): {session_file.name}")
                     continue
+                if cleanup and is_empty_session(session_file):
+                    if verbose:
+                        print(f"  CLEANUP: {session_file.name}")
+                    if not dry_run:
+                        try:
+                            session_file.unlink()
+                            if index_data and "entries" in index_data:
+                                sid = session_file.stem
+                                index_data["entries"] = [
+                                    e for e in index_data["entries"]
+                                    if e.get("sessionId") != sid
+                                ]
+                                index_modified = True
+                            cleaned += 1
+                        except OSError as e:
+                            print(f"  ERROR deleting {session_file.name}: {e}", file=sys.stderr)
+                    else:
+                        cleaned += 1
+                    continue
                 index_modified_ref[0] = False
                 process(session_file, index_data, index_modified_ref)
                 if index_modified_ref[0]:
@@ -674,10 +732,17 @@ def main():
                     print(f"  WARNING: Failed to update sessions-index.json in {project_dir.name}", file=sys.stderr)
 
     action = "Would rename" if dry_run else "Renamed"
-    print(
-        f"\n{action}: {renamed} | Already titled: {skipped_has_title} | "
-        f"No match: {skipped_no_match} | Empty: {skipped_empty} | Too old: {skipped_old}"
-    )
+    parts = [
+        f"{action}: {renamed}",
+        f"Already titled: {skipped_has_title}",
+        f"No match: {skipped_no_match}",
+        f"Empty: {skipped_empty}",
+        f"Too old: {skipped_old}",
+    ]
+    if cleanup:
+        clean_action = "Would delete" if dry_run else "Deleted"
+        parts.append(f"{clean_action}: {cleaned}")
+    print(f"\n{' | '.join(parts)}")
 
 
 if __name__ == "__main__":
