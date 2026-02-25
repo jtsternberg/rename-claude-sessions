@@ -26,6 +26,7 @@ Usage:
     rename-claude-sessions              # run for real
     rename-claude-sessions --dry-run    # preview changes only
     rename-claude-sessions --verbose    # show all decisions
+    rename-claude-sessions --force      # include active sessions (skip idle check)
     rename-claude-sessions --max-age-days 5  # skip sessions older than 5 days (default)
     rename-claude-sessions --title-provider ollama --ollama-model qwen2.5-coder:1.5b
     rename-claude-sessions --title-provider claude --claude-model claude-3-5-haiku-latest
@@ -498,6 +499,7 @@ def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> str | No
 def main():
     dry_run = "--dry-run" in sys.argv
     verbose = "--verbose" in sys.argv
+    force = "--force" in sys.argv
     title_provider = "ollama"
     claude_model = DEFAULT_CLAUDE_MODEL
     ollama_model = DEFAULT_OLLAMA_MODEL
@@ -654,7 +656,7 @@ def main():
                 except OSError:
                     continue
                 age_seconds = now - mtime
-                if age_seconds < ACTIVE_THRESHOLD_SECONDS:
+                if not force and age_seconds < ACTIVE_THRESHOLD_SECONDS:
                     if verbose:
                         print(f"  SKIP (active): {session_file.name}")
                     continue
