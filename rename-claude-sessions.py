@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 rename-claude-sessions - Auto-rename Claude Code sessions to meaningful
 titles based on issue/PR context.
@@ -24,6 +26,7 @@ Usage:
     rename-claude-sessions              # run for real
     rename-claude-sessions --dry-run    # preview changes only
     rename-claude-sessions --verbose    # show all decisions
+    rename-claude-sessions --max-age-days 5  # skip sessions older than 5 days (default)
     rename-claude-sessions --title-provider ollama --ollama-model qwen2.5-coder:1.5b
     rename-claude-sessions --title-provider claude --claude-model claude-3-5-haiku-latest
     rename-claude-sessions --file PATH [--force-title "Title"]  # single file; --force-title forces that title (to test mtime preservation when no strategy matches)
@@ -44,6 +47,7 @@ from pathlib import Path
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SKIP_BRANCHES = {"master", "main", "develop", "staging"}
 ACTIVE_THRESHOLD_SECONDS = 300
+DEFAULT_MAX_AGE_DAYS = 5
 CLAUDE_EXCERPT_MAX_CHARS = 3000
 TITLE_TIMEOUT = 45
 DEFAULT_CLAUDE_MODEL = "claude-3-5-haiku-latest"
@@ -404,7 +408,7 @@ def _title_prompt_from_meta(meta: dict) -> str | None:
         excerpt = excerpt[:CLAUDE_EXCERPT_MAX_CHARS] + "…"
 
     return (
-        "Generate a very short title (3–8 words) for this coding conversation. "
+        "Generate a very short title (5–15 words) for this coding conversation. "
         "Reply with only the title, no quotes, no explanation.\n\nConversation excerpt:\n\n"
     ) + excerpt
 
@@ -459,10 +463,11 @@ def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> str | No
 
 def main():
     dry_run = "--dry-run" in sys.argv
-    verbose = "--verbose" in sys.argv or dry_run
+    verbose = "--verbose" in sys.argv
     title_provider = "ollama"
     claude_model = DEFAULT_CLAUDE_MODEL
     ollama_model = DEFAULT_OLLAMA_MODEL
+    max_age_days = DEFAULT_MAX_AGE_DAYS
     single_file: Path | None = None
     force_title: str | None = None
     if "--title-provider" in sys.argv:
@@ -485,6 +490,16 @@ def main():
             ollama_model = sys.argv[i + 1]
         if not ollama_model:
             print("Usage: --ollama-model <model-name>", file=sys.stderr)
+            sys.exit(1)
+    if "--max-age-days" in sys.argv:
+        i = sys.argv.index("--max-age-days")
+        if i + 1 < len(sys.argv):
+            try:
+                max_age_days = int(sys.argv[i + 1])
+            except ValueError:
+                max_age_days = -1
+        if max_age_days < 0:
+            print("Usage: --max-age-days must be an integer >= 0 (0 disables age limit)", file=sys.stderr)
             sys.exit(1)
     if "--file" in sys.argv:
         i = sys.argv.index("--file")
@@ -512,6 +527,7 @@ def main():
     skipped_has_title = 0
     skipped_no_match = 0
     skipped_empty = 0
+    skipped_old = 0
 
     def process(session_file: Path) -> None:
         nonlocal renamed, skipped_has_title, skipped_no_match, skipped_empty
@@ -550,8 +566,9 @@ def main():
                 print(f"  SKIP (no match): branch={branch} | msg={first}")
             return
 
-        if verbose:
+        if dry_run or verbose:
             print(f"  RENAME: {new_title}")
+        if verbose:
             print(f"          branch: {meta.get('branch', '(none)')} | {session_file.name}")
 
         if dry_run:
@@ -578,6 +595,8 @@ def main():
     if single_file:
         process(single_file)
     else:
+        now = time.time()
+        max_age_seconds = max_age_days * 86400
         for project_dir in sorted(CLAUDE_PROJECTS_DIR.iterdir()):
             if not project_dir.is_dir():
                 continue
@@ -586,14 +605,23 @@ def main():
                     mtime = session_file.stat().st_mtime
                 except OSError:
                     continue
-                if time.time() - mtime < ACTIVE_THRESHOLD_SECONDS:
+                age_seconds = now - mtime
+                if age_seconds < ACTIVE_THRESHOLD_SECONDS:
                     if verbose:
                         print(f"  SKIP (active): {session_file.name}")
+                    continue
+                if max_age_days > 0 and age_seconds > max_age_seconds:
+                    skipped_old += 1
+                    if verbose:
+                        print(f"  SKIP (old): {session_file.name}")
                     continue
                 process(session_file)
 
     action = "Would rename" if dry_run else "Renamed"
-    print(f"\n{action}: {renamed} | Already titled: {skipped_has_title} | No match: {skipped_no_match} | Empty: {skipped_empty}")
+    print(
+        f"\n{action}: {renamed} | Already titled: {skipped_has_title} | "
+        f"No match: {skipped_no_match} | Empty: {skipped_empty} | Too old: {skipped_old}"
+    )
 
 
 if __name__ == "__main__":
