@@ -7,8 +7,9 @@ Strategies (in order):
   1. GitHub URL in first message → fetch title via gh
   2. Issue number in branch name → fetch title via gh  (skipped for monorepo roots)
   3. PR lookup for the branch → fetch title via gh     (skipped for monorepo roots)
-  4. If still no title: claude -p with Haiku to generate a short title from the first few messages
-  5. Skip only when there's truly no clue (or Claude CLI unavailable)
+  4. If still no title: LLM fallback (provider selectable via flags) to generate
+     a short title from the first few messages
+  5. Skip only when there's truly no clue (or provider CLI unavailable)
 
 Monorepo detection: If the session's cwd is a git repo that contains nested
 git repos (up to 2 levels deep), it's treated as a monorepo root. The branch
@@ -23,6 +24,8 @@ Usage:
     rename-claude-sessions              # run for real
     rename-claude-sessions --dry-run    # preview changes only
     rename-claude-sessions --verbose    # show all decisions
+    rename-claude-sessions --title-provider ollama --ollama-model qwen2.5-coder:1.5b
+    rename-claude-sessions --title-provider claude --claude-model claude-3-5-haiku-latest
     rename-claude-sessions --file PATH [--force-title "Title"]  # single file; --force-title forces that title (to test mtime preservation when no strategy matches)
 
 Install as cron (every 30 minutes):
@@ -42,8 +45,9 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SKIP_BRANCHES = {"master", "main", "develop", "staging"}
 ACTIVE_THRESHOLD_SECONDS = 300
 CLAUDE_EXCERPT_MAX_CHARS = 3000
-CLAUDE_TITLE_TIMEOUT = 45
-CLAUDE_MODEL = "claude-3-5-haiku-latest"
+TITLE_TIMEOUT = 45
+DEFAULT_CLAUDE_MODEL = "claude-3-5-haiku-latest"
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:1.5b"
 _monorepo_cache: dict[str, bool] = {}
 
 # Regex for GitHub issue/PR URLs
@@ -379,8 +383,17 @@ def resolve_title(meta: dict, repo_cache: dict, title_cache: dict, pr_cache: dic
     return None
 
 
-def generate_title_via_claude(meta: dict, verbose: bool) -> str | None:
-    """Use claude -p with Haiku to generate a short title from the first few messages."""
+def _clean_model_title(text: str) -> str | None:
+    title = text.strip().split("\n")[0].strip()
+    # Drop quotes if the model wrapped the title
+    if len(title) >= 2 and title[0] == title[-1] and title[0] in "\"'":
+        title = title[1:-1].strip()
+    if 2 <= len(title) <= 80:
+        return title
+    return None
+
+
+def _title_prompt_from_meta(meta: dict) -> str | None:
     texts = meta.get("allUserTexts") or []
     if not texts:
         return None
@@ -390,39 +403,89 @@ def generate_title_via_claude(meta: dict, verbose: bool) -> str | None:
     if len(excerpt) > CLAUDE_EXCERPT_MAX_CHARS:
         excerpt = excerpt[:CLAUDE_EXCERPT_MAX_CHARS] + "…"
 
-    prompt = (
+    return (
         "Generate a very short title (3–8 words) for this coding conversation. "
         "Reply with only the title, no quotes, no explanation.\n\nConversation excerpt:\n\n"
     ) + excerpt
 
+
+def generate_title_via_claude(meta: dict, verbose: bool, model: str) -> str | None:
+    """Use claude -p to generate a short title from the first few messages."""
+    prompt = _title_prompt_from_meta(meta)
+    if not prompt:
+        return None
+
     try:
         result = subprocess.run(
-            ["claude", "--model", CLAUDE_MODEL, "-p", prompt],
+            ["claude", "--model", model, "-p", prompt],
             capture_output=True,
             text=True,
-            timeout=CLAUDE_TITLE_TIMEOUT,
+            timeout=TITLE_TIMEOUT,
         )
         if result.returncode != 0 or not result.stdout:
             if verbose and result.stderr:
                 print(f"    (claude: {result.stderr.strip()[:200]})")
             return None
-        title = result.stdout.strip().split("\n")[0].strip()
-        # Drop quotes if the model wrapped the title
-        if len(title) >= 2 and title[0] == title[-1] and title[0] in "\"'":
-            title = title[1:-1].strip()
-        if 2 <= len(title) <= 80:
-            return title
+        return _clean_model_title(result.stdout)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         if verbose:
             print(f"    (claude: {e})")
     return None
 
 
+def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> str | None:
+    """Use ollama run to generate a short title from the first few messages."""
+    prompt = _title_prompt_from_meta(meta)
+    if not prompt:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model, prompt],
+            capture_output=True,
+            text=True,
+            timeout=TITLE_TIMEOUT,
+        )
+        if result.returncode != 0 or not result.stdout:
+            if verbose and result.stderr:
+                print(f"    (ollama: {result.stderr.strip()[:200]})")
+            return None
+        return _clean_model_title(result.stdout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        if verbose:
+            print(f"    (ollama: {e})")
+    return None
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     verbose = "--verbose" in sys.argv or dry_run
+    title_provider = "ollama"
+    claude_model = DEFAULT_CLAUDE_MODEL
+    ollama_model = DEFAULT_OLLAMA_MODEL
     single_file: Path | None = None
     force_title: str | None = None
+    if "--title-provider" in sys.argv:
+        i = sys.argv.index("--title-provider")
+        if i + 1 < len(sys.argv):
+            title_provider = sys.argv[i + 1].lower()
+        if title_provider not in {"ollama", "claude", "auto"}:
+            print("Usage: --title-provider must be one of: ollama, claude, auto", file=sys.stderr)
+            sys.exit(1)
+    if "--claude-model" in sys.argv:
+        i = sys.argv.index("--claude-model")
+        if i + 1 < len(sys.argv):
+            claude_model = sys.argv[i + 1]
+        if not claude_model:
+            print("Usage: --claude-model <model-name>", file=sys.stderr)
+            sys.exit(1)
+    if "--ollama-model" in sys.argv:
+        i = sys.argv.index("--ollama-model")
+        if i + 1 < len(sys.argv):
+            ollama_model = sys.argv[i + 1]
+        if not ollama_model:
+            print("Usage: --ollama-model <model-name>", file=sys.stderr)
+            sys.exit(1)
     if "--file" in sys.argv:
         i = sys.argv.index("--file")
         if i + 1 < len(sys.argv):
@@ -471,7 +534,14 @@ def main():
 
         new_title = force_title if force_title else resolve_title(meta, repo_cache, title_cache, pr_cache, verbose)
         if not new_title:
-            new_title = generate_title_via_claude(meta, verbose)
+            if title_provider == "ollama":
+                new_title = generate_title_via_ollama(meta, verbose, ollama_model)
+            elif title_provider == "claude":
+                new_title = generate_title_via_claude(meta, verbose, claude_model)
+            else:
+                new_title = generate_title_via_ollama(meta, verbose, ollama_model)
+                if not new_title:
+                    new_title = generate_title_via_claude(meta, verbose, claude_model)
         if not new_title:
             skipped_no_match += 1
             if verbose:
