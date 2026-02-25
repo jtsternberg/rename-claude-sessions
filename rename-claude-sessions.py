@@ -7,19 +7,23 @@ Strategies (in order):
   1. GitHub URL in first message → fetch title via gh
   2. Issue number in branch name → fetch title via gh  (skipped for monorepo roots)
   3. PR lookup for the branch → fetch title via gh     (skipped for monorepo roots)
-  4. Skip only when there's truly no clue
+  4. If still no title: claude -p with Haiku to generate a short title from the first few messages
+  5. Skip only when there's truly no clue (or Claude CLI unavailable)
 
 Monorepo detection: If the session's cwd is a git repo that contains nested
 git repos (up to 2 levels deep), it's treated as a monorepo root. The branch
 in a monorepo belongs to the monorepo itself, not to the session's actual work,
 so branch-based strategies are skipped.
 
-Uses the same custom-title JSONL record as Ctrl+R rename.
+Uses the same custom-title JSONL record as Ctrl+R rename. When appending the
+custom-title line, the script restores the file's mtime/atime so "last modified"
+does not change and session order in the UI is preserved.
 
 Usage:
     rename-claude-sessions              # run for real
     rename-claude-sessions --dry-run    # preview changes only
     rename-claude-sessions --verbose    # show all decisions
+    rename-claude-sessions --file PATH [--force-title "Title"]  # single file; --force-title forces that title (to test mtime preservation when no strategy matches)
 
 Install as cron (every 30 minutes):
     crontab -e
@@ -37,6 +41,9 @@ from pathlib import Path
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SKIP_BRANCHES = {"master", "main", "develop", "staging"}
 ACTIVE_THRESHOLD_SECONDS = 300
+CLAUDE_EXCERPT_MAX_CHARS = 3000
+CLAUDE_TITLE_TIMEOUT = 45
+CLAUDE_MODEL = "claude-3-5-haiku-latest"
 _monorepo_cache: dict[str, bool] = {}
 
 # Regex for GitHub issue/PR URLs
@@ -291,7 +298,12 @@ def read_session_metadata(filepath: Path) -> dict | None:
 
 
 def set_custom_title(filepath: Path, session_id: str, title: str) -> bool:
-    """Append a custom-title record to the session JSONL."""
+    """Append a custom-title record to the session JSONL, preserving mtime/atime."""
+    try:
+        st = filepath.stat()
+        atime, mtime = st.st_atime, st.st_mtime
+    except OSError:
+        atime = mtime = None
     record = {
         "type": "custom-title",
         "customTitle": title,
@@ -300,6 +312,8 @@ def set_custom_title(filepath: Path, session_id: str, title: str) -> bool:
     try:
         with open(filepath, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if atime is not None and mtime is not None:
+            os.utime(filepath, (atime, mtime))
         return True
     except OSError as e:
         print(f"  ERROR writing {filepath}: {e}", file=sys.stderr)
@@ -365,11 +379,66 @@ def resolve_title(meta: dict, repo_cache: dict, title_cache: dict, pr_cache: dic
     return None
 
 
+def generate_title_via_claude(meta: dict, verbose: bool) -> str | None:
+    """Use claude -p with Haiku to generate a short title from the first few messages."""
+    texts = meta.get("allUserTexts") or []
+    if not texts:
+        return None
+    excerpt = "\n".join(texts).strip()
+    if not excerpt:
+        return None
+    if len(excerpt) > CLAUDE_EXCERPT_MAX_CHARS:
+        excerpt = excerpt[:CLAUDE_EXCERPT_MAX_CHARS] + "…"
+
+    prompt = (
+        "Generate a very short title (3–8 words) for this coding conversation. "
+        "Reply with only the title, no quotes, no explanation.\n\nConversation excerpt:\n\n"
+    ) + excerpt
+
+    try:
+        result = subprocess.run(
+            ["claude", "--model", CLAUDE_MODEL, "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_TITLE_TIMEOUT,
+        )
+        if result.returncode != 0 or not result.stdout:
+            if verbose and result.stderr:
+                print(f"    (claude: {result.stderr.strip()[:200]})")
+            return None
+        title = result.stdout.strip().split("\n")[0].strip()
+        # Drop quotes if the model wrapped the title
+        if len(title) >= 2 and title[0] == title[-1] and title[0] in "\"'":
+            title = title[1:-1].strip()
+        if 2 <= len(title) <= 80:
+            return title
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        if verbose:
+            print(f"    (claude: {e})")
+    return None
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     verbose = "--verbose" in sys.argv or dry_run
+    single_file: Path | None = None
+    force_title: str | None = None
+    if "--file" in sys.argv:
+        i = sys.argv.index("--file")
+        if i + 1 < len(sys.argv):
+            single_file = Path(sys.argv[i + 1]).expanduser().resolve()
+        if not single_file or not single_file.is_file():
+            print("Usage: rename-claude-sessions --file <path-to-session.jsonl> [--force-title \"Title\"]", file=sys.stderr)
+            sys.exit(1)
+        if "--force-title" in sys.argv:
+            j = sys.argv.index("--force-title")
+            if j + 1 < len(sys.argv):
+                force_title = sys.argv[j + 1]
+            if not force_title:
+                print("Usage: rename-claude-sessions --file <path> --force-title \"Your title\"", file=sys.stderr)
+                sys.exit(1)
 
-    if not CLAUDE_PROJECTS_DIR.is_dir():
+    if not single_file and not CLAUDE_PROJECTS_DIR.is_dir():
         print(f"No Claude projects directory at {CLAUDE_PROJECTS_DIR}")
         return
 
@@ -381,62 +450,77 @@ def main():
     skipped_no_match = 0
     skipped_empty = 0
 
-    for project_dir in sorted(CLAUDE_PROJECTS_DIR.iterdir()):
-        if not project_dir.is_dir():
-            continue
+    def process(session_file: Path) -> None:
+        nonlocal renamed, skipped_has_title, skipped_no_match, skipped_empty
+        meta = read_session_metadata(session_file)
+        if not meta:
+            skipped_empty += 1
+            return
 
-        for session_file in sorted(project_dir.glob("*.jsonl")):
-            # Skip recently modified files (likely active sessions)
-            try:
-                mtime = session_file.stat().st_mtime
-            except OSError:
-                continue
-            if time.time() - mtime < ACTIVE_THRESHOLD_SECONDS:
-                if verbose:
-                    print(f"  SKIP (active): {session_file.name}")
-                continue
+        if not force_title and meta["hasCustomTitle"]:
+            skipped_has_title += 1
+            return
 
-            meta = read_session_metadata(session_file)
-            if not meta:
-                skipped_empty += 1
-                continue
+        if not force_title and not meta.get("branch") and not meta.get("firstText"):
+            skipped_empty += 1
+            return
 
-            # Skip sessions that already have a custom title
-            if meta["hasCustomTitle"]:
-                skipped_has_title += 1
-                continue
+        cwd = meta.get("cwd")
+        if cwd and is_monorepo_root(cwd):
+            meta["is_monorepo"] = True
 
-            # Skip sessions with no useful metadata at all
-            if not meta.get("branch") and not meta.get("firstText"):
-                skipped_empty += 1
-                continue
-
-            # Detect monorepo roots — branch doesn't reflect session content
-            cwd = meta.get("cwd")
-            if cwd and is_monorepo_root(cwd):
-                meta["is_monorepo"] = True
-
-            new_title = resolve_title(meta, repo_cache, title_cache, pr_cache, verbose)
-
-            if not new_title:
-                skipped_no_match += 1
-                if verbose:
-                    branch = meta.get("branch", "(none)")
-                    first = (meta.get("firstText") or "(empty)")[:80]
-                    print(f"  SKIP (no match): branch={branch} | msg={first}")
-                continue
-
+        new_title = force_title if force_title else resolve_title(meta, repo_cache, title_cache, pr_cache, verbose)
+        if not new_title:
+            new_title = generate_title_via_claude(meta, verbose)
+        if not new_title:
+            skipped_no_match += 1
             if verbose:
-                print(f"  RENAME: {new_title}")
-                print(f"          branch: {meta.get('branch', '(none)')} | {session_file.name}")
+                branch = meta.get("branch", "(none)")
+                first = (meta.get("firstText") or "(empty)")[:80]
+                print(f"  SKIP (no match): branch={branch} | msg={first}")
+            return
 
-            if not dry_run:
-                if set_custom_title(session_file, meta["sessionId"], new_title):
-                    renamed += 1
+        if verbose:
+            print(f"  RENAME: {new_title}")
+            print(f"          branch: {meta.get('branch', '(none)')} | {session_file.name}")
+
+        if dry_run:
+            renamed += 1
+            return
+
+        # Single-file test: show mtime/atime before and after
+        if single_file:
+            st_before = session_file.stat()
+            print(f"  Before: mtime={st_before.st_mtime} atime={st_before.st_atime}")
+
+        if set_custom_title(session_file, meta["sessionId"], new_title):
+            renamed += 1
+            if single_file:
+                st_after = session_file.stat()
+                print(f"  After:  mtime={st_after.st_mtime} atime={st_after.st_atime}")
+                if (st_before.st_mtime, st_before.st_atime) == (st_after.st_mtime, st_after.st_atime):
+                    print("  OK: timestamps preserved")
                 else:
-                    print(f"  FAILED: {session_file.name}", file=sys.stderr)
-            else:
-                renamed += 1
+                    print("  MISMATCH: timestamps changed", file=sys.stderr)
+        else:
+            print(f"  FAILED: {session_file.name}", file=sys.stderr)
+
+    if single_file:
+        process(single_file)
+    else:
+        for project_dir in sorted(CLAUDE_PROJECTS_DIR.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            for session_file in sorted(project_dir.glob("*.jsonl")):
+                try:
+                    mtime = session_file.stat().st_mtime
+                except OSError:
+                    continue
+                if time.time() - mtime < ACTIVE_THRESHOLD_SECONDS:
+                    if verbose:
+                        print(f"  SKIP (active): {session_file.name}")
+                    continue
+                process(session_file)
 
     action = "Would rename" if dry_run else "Renamed"
     print(f"\n{action}: {renamed} | Already titled: {skipped_has_title} | No match: {skipped_no_match} | Empty: {skipped_empty}")
