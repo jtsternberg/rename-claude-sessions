@@ -234,6 +234,7 @@ def read_session_metadata(filepath: Path) -> dict | None:
     session_id = branch = cwd = first_text = None
     all_user_texts: list[str] = []
     has_custom_title = False
+    custom_title_value: str | None = None
     try:
         with open(filepath) as f:
             for i, line in enumerate(f):
@@ -243,6 +244,7 @@ def read_session_metadata(filepath: Path) -> dict | None:
                     d = json.loads(line)
                     if d.get("type") == "custom-title":
                         has_custom_title = True
+                        custom_title_value = d.get("customTitle")
                         break
                     if not session_id and d.get("sessionId"):
                         session_id = d["sessionId"]
@@ -286,6 +288,7 @@ def read_session_metadata(filepath: Path) -> dict | None:
                             d = json.loads(line)
                             if d.get("type") == "custom-title":
                                 has_custom_title = True
+                                custom_title_value = d.get("customTitle")
                                 break
                         except json.JSONDecodeError:
                             continue
@@ -302,11 +305,37 @@ def read_session_metadata(filepath: Path) -> dict | None:
         "firstText": first_text,
         "allUserTexts": all_user_texts,
         "hasCustomTitle": has_custom_title,
+        "customTitleValue": custom_title_value,
     }
 
 
-def set_custom_title(filepath: Path, session_id: str, title: str) -> bool:
-    """Append a custom-title record to the session JSONL, preserving mtime/atime."""
+def load_sessions_index(project_dir: Path) -> dict | None:
+    """Load sessions-index.json for a project directory."""
+    index_path = project_dir / "sessions-index.json"
+    if not index_path.exists():
+        return None
+    try:
+        with open(index_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_sessions_index(project_dir: Path, index_data: dict) -> bool:
+    """Write sessions-index.json back to disk."""
+    index_path = project_dir / "sessions-index.json"
+    try:
+        with open(index_path, "w") as f:
+            json.dump(index_data, f, ensure_ascii=False)
+        return True
+    except OSError as e:
+        print(f"  ERROR writing {index_path}: {e}", file=sys.stderr)
+        return False
+
+
+def set_custom_title(filepath: Path, session_id: str, title: str, index_data: dict | None = None) -> bool:
+    """Append a custom-title record to the session JSONL, preserving mtime/atime.
+    If index_data is provided, update the matching entry's customTitle so Ctrl+R shows the title."""
     try:
         st = filepath.stat()
         atime, mtime = st.st_atime, st.st_mtime
@@ -322,6 +351,11 @@ def set_custom_title(filepath: Path, session_id: str, title: str) -> bool:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         if atime is not None and mtime is not None:
             os.utime(filepath, (atime, mtime))
+        if index_data and "entries" in index_data:
+            for entry in index_data["entries"]:
+                if entry.get("sessionId") == session_id:
+                    entry["customTitle"] = title
+                    break
         return True
     except OSError as e:
         print(f"  ERROR writing {filepath}: {e}", file=sys.stderr)
@@ -529,7 +563,7 @@ def main():
     skipped_empty = 0
     skipped_old = 0
 
-    def process(session_file: Path) -> None:
+    def process(session_file: Path, index_data: dict | None = None, index_modified_ref: list | None = None) -> None:
         nonlocal renamed, skipped_has_title, skipped_no_match, skipped_empty
         meta = read_session_metadata(session_file)
         if not meta:
@@ -537,6 +571,15 @@ def main():
             return
 
         if not force_title and meta["hasCustomTitle"]:
+            if index_data and not dry_run and meta.get("customTitleValue"):
+                for entry in index_data.get("entries", []):
+                    if entry.get("sessionId") == meta["sessionId"] and "customTitle" not in entry:
+                        entry["customTitle"] = meta["customTitleValue"]
+                        if index_modified_ref is not None:
+                            index_modified_ref[0] = True
+                        if verbose:
+                            print(f"  SYNC INDEX: {meta['customTitleValue']}")
+                        break
             skipped_has_title += 1
             return
 
@@ -580,8 +623,10 @@ def main():
             st_before = session_file.stat()
             print(f"  Before: mtime={st_before.st_mtime} atime={st_before.st_atime}")
 
-        if set_custom_title(session_file, meta["sessionId"], new_title):
+        if set_custom_title(session_file, meta["sessionId"], new_title, index_data):
             renamed += 1
+            if index_modified_ref is not None:
+                index_modified_ref[0] = True
             if single_file:
                 st_after = session_file.stat()
                 print(f"  After:  mtime={st_after.st_mtime} atime={st_after.st_atime}")
@@ -600,6 +645,9 @@ def main():
         for project_dir in sorted(CLAUDE_PROJECTS_DIR.iterdir()):
             if not project_dir.is_dir():
                 continue
+            index_data = load_sessions_index(project_dir)
+            index_modified = False
+            index_modified_ref: list[bool] = [False]
             for session_file in sorted(project_dir.glob("*.jsonl")):
                 try:
                     mtime = session_file.stat().st_mtime
@@ -615,7 +663,13 @@ def main():
                     if verbose:
                         print(f"  SKIP (old): {session_file.name}")
                     continue
-                process(session_file)
+                index_modified_ref[0] = False
+                process(session_file, index_data, index_modified_ref)
+                if index_modified_ref[0]:
+                    index_modified = True
+            if index_modified and index_data and not dry_run:
+                if not save_sessions_index(project_dir, index_data):
+                    print(f"  WARNING: Failed to update sessions-index.json in {project_dir.name}", file=sys.stderr)
 
     action = "Would rename" if dry_run else "Renamed"
     print(
