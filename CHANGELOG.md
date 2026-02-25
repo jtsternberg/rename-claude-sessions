@@ -18,8 +18,13 @@ All notable changes since the first version (credit: @fernandoduro).
 - **--force** (credit: @fernandoduro) — Include active sessions (skip the 300s idle check).
 - **--cleanup** (credit: @fernandoduro) — Delete sessions with no real user messages (only IDE tags, etc.) and remove them from the index. Summary line reports “Deleted” / “Would delete” when used.
 
+### Fixed
+
+- **Python 3.9 compatibility** — Replaced PEP 604/585 type hints (`str | None`, `list[...]`) with `typing` equivalents (`Optional[str]`, `List[...]`) so the script runs on Python < 3.10 (fixes `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` in cron when system `python3` is older).
+
 ### Changed
 
+- **README: cron** — Document using the full path to `python3` in the cron job so the correct Python version is used; optional one-liner records `$(which python3)` into crontab.
 - LLM title prompt now suggests “5–15 words” instead of “3–8 words”.
 - `--verbose` is no longer implied by `--dry-run`; dry-run still prints each “RENAME” line.
 - Internal refactor: shared `_title_prompt_from_meta()` and `_clean_model_title()`; single `process()` used for both batch and `--file` runs.

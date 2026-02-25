@@ -107,18 +107,32 @@ Useful flags:
 
 ## Cron setup
 
-Current recommended cron (every 30 minutes):
+Cron uses a minimal environment: `python3` may point to an older system Python (e.g. macOS 3.9) and can cause type-hint or dependency errors. Use the **full path** to the Python you want.
 
-```cron
-*/30 * * * * PATH="$HOME/.local/bin:$PATH" python3 "$HOME/Code/rename-claude-sessions/rename-claude-sessions.py" --title-provider ollama --ollama-model qwen2.5-coder:1.5b >> /tmp/rename-claude-sessions.log 2>&1
-```
-
-Optional (more portable) setup using a script path variable:
+Find it (in a shell where you normally run the script):
 
 ```bash
-SCRIPT="$HOME/path/to/rename-claude-sessions/rename-claude-sessions.py"
-(crontab -l 2>/dev/null; echo "*/30 * * * * PATH=\"$HOME/.local/bin:$PATH\" python3 \"$SCRIPT\" --title-provider ollama --ollama-model qwen2.5-coder:1.5b >> /tmp/rename-claude-sessions.log 2>&1") | crontab -
+which python3
+# e.g. /opt/homebrew/bin/python3 or ~/.pyenv/shims/python3
 ```
+
+Current recommended cron (every 30 minutes), with explicit Python:
+
+```cron
+*/30 * * * * PATH="$HOME/.local/bin:$PATH" /opt/homebrew/bin/python3 "$HOME/Code/rename-claude-sessions/rename-claude-sessions.py" --title-provider ollama --ollama-model qwen2.5-coder:1.5b >> /tmp/rename-claude-sessions.log 2>&1
+```
+
+Replace `/opt/homebrew/bin/python3` with the path from `which python3` (e.g. `$HOME/.pyenv/shims/python3` if you use pyenv).
+
+Optional (more portable) setup using variables:
+
+```bash
+PYTHON="$(which python3)"
+SCRIPT="$HOME/Code/rename-claude-sessions/rename-claude-sessions.py"
+(crontab -l 2>/dev/null; echo "*/30 * * * * PATH=\"$HOME/.local/bin:\$PATH\" $PYTHON \"$SCRIPT\" --title-provider ollama --ollama-model qwen2.5-coder:1.5b >> /tmp/rename-claude-sessions.log 2>&1") | crontab -
+```
+
+That records the current `python3` path into crontab so the job keeps using that binary.
 
 ## Check cron
 

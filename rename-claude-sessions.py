@@ -45,6 +45,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SKIP_BRANCHES = {"master", "main", "develop", "staging"}
@@ -54,7 +55,7 @@ CLAUDE_EXCERPT_MAX_CHARS = 3000
 TITLE_TIMEOUT = 45
 DEFAULT_CLAUDE_MODEL = "claude-3-5-haiku-latest"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:1.5b"
-_monorepo_cache: dict[str, bool] = {}
+_monorepo_cache: Dict[str, bool] = {}
 
 # Regex for GitHub issue/PR URLs
 GH_URL_RE = re.compile(
@@ -63,7 +64,7 @@ GH_URL_RE = re.compile(
 
 # Known project directory → repo mappings (fallback when cwd is gone)
 # Built dynamically from working cwds during the run
-_repo_from_project_dir: dict[str, str] = {}
+_repo_from_project_dir: Dict[str, str] = {}
 
 
 def is_monorepo_root(cwd: str) -> bool:
@@ -100,7 +101,7 @@ def is_monorepo_root(cwd: str) -> bool:
     return False
 
 
-def extract_issue_number(branch: str) -> str | None:
+def extract_issue_number(branch: str) -> Optional[str]:
     """Extract issue/PR number from branch name like fd/feat/554-description."""
     if not branch or branch in SKIP_BRANCHES:
         return None
@@ -113,7 +114,7 @@ def extract_issue_number(branch: str) -> str | None:
     return None
 
 
-def extract_github_urls(text: str) -> list[tuple[str, str, str]]:
+def extract_github_urls(text: str) -> List[Tuple[str, str, str]]:
     """Extract (repo, type, number) tuples from GitHub URLs in text.
     type is 'issues' or 'pull'."""
     if not text:
@@ -121,7 +122,7 @@ def extract_github_urls(text: str) -> list[tuple[str, str, str]]:
     return GH_URL_RE.findall(text)
 
 
-def run_gh(args: list[str], cwd: str | None = None, timeout: int = 15) -> str | None:
+def run_gh(args: List[str], cwd: Optional[str] = None, timeout: int = 15) -> Optional[str]:
     """Run a gh CLI command and return stdout, or None on failure."""
     try:
         result = subprocess.run(
@@ -135,7 +136,7 @@ def run_gh(args: list[str], cwd: str | None = None, timeout: int = 15) -> str | 
     return None
 
 
-def get_repo_for_cwd(cwd: str, cache: dict) -> str | None:
+def get_repo_for_cwd(cwd: str, cache: dict) -> Optional[str]:
     """Get GitHub repo (owner/name) for a working directory."""
     if cwd in cache:
         return cache[cwd]
@@ -150,7 +151,7 @@ def get_repo_for_cwd(cwd: str, cache: dict) -> str | None:
     return repo
 
 
-def infer_repo_for_cwd(cwd: str, repo_cache: dict) -> str | None:
+def infer_repo_for_cwd(cwd: str, repo_cache: dict) -> Optional[str]:
     """Try to infer the repo when cwd doesn't exist anymore.
     Walks up parent directories looking for an existing git repo."""
     if cwd in repo_cache:
@@ -186,7 +187,7 @@ def infer_repo_for_cwd(cwd: str, repo_cache: dict) -> str | None:
     return None
 
 
-def get_issue_or_pr_title(number: str, repo: str, cache: dict) -> tuple[str, str] | None:
+def get_issue_or_pr_title(number: str, repo: str, cache: dict) -> Optional[Tuple[str, str]]:
     """Fetch issue/PR title. Returns (type, title) or None."""
     cache_key = f"{repo}:{number}"
     if cache_key in cache:
@@ -208,7 +209,7 @@ def get_issue_or_pr_title(number: str, repo: str, cache: dict) -> tuple[str, str
     return None
 
 
-def find_pr_for_branch(branch: str, repo: str, cache: dict) -> tuple[str, str] | None:
+def find_pr_for_branch(branch: str, repo: str, cache: dict) -> Optional[Tuple[str, str]]:
     """Find a PR for a branch. Returns (number, title) or None."""
     cache_key = f"{repo}:branch:{branch}"
     if cache_key in cache:
@@ -230,13 +231,13 @@ def find_pr_for_branch(branch: str, repo: str, cache: dict) -> tuple[str, str] |
     return None
 
 
-def read_session_metadata(filepath: Path) -> dict | None:
+def read_session_metadata(filepath: Path) -> Optional[dict]:
     """Read sessionId, branch, cwd, first message text, and check for custom-title.
     Collects all user text from the first 50 lines for URL extraction."""
     session_id = branch = cwd = first_text = None
-    all_user_texts: list[str] = []
+    all_user_texts: List[str] = []
     has_custom_title = False
-    custom_title_value: str | None = None
+    custom_title_value: Optional[str] = None
     try:
         with open(filepath) as f:
             for i, line in enumerate(f):
@@ -347,7 +348,7 @@ def is_empty_session(filepath: Path) -> bool:
     return True
 
 
-def load_sessions_index(project_dir: Path) -> dict | None:
+def load_sessions_index(project_dir: Path) -> Optional[dict]:
     """Load sessions-index.json for a project directory."""
     index_path = project_dir / "sessions-index.json"
     if not index_path.exists():
@@ -371,7 +372,7 @@ def save_sessions_index(project_dir: Path, index_data: dict) -> bool:
         return False
 
 
-def set_custom_title(filepath: Path, session_id: str, title: str, index_data: dict | None = None) -> bool:
+def set_custom_title(filepath: Path, session_id: str, title: str, index_data: Optional[dict] = None) -> bool:
     """Append a custom-title record to the session JSONL, preserving mtime/atime.
     If index_data is provided, update the matching entry's customTitle so Ctrl+R shows the title."""
     try:
@@ -400,7 +401,7 @@ def set_custom_title(filepath: Path, session_id: str, title: str, index_data: di
         return False
 
 
-def resolve_title(meta: dict, repo_cache: dict, title_cache: dict, pr_cache: dict, verbose: bool) -> str | None:
+def resolve_title(meta: dict, repo_cache: dict, title_cache: dict, pr_cache: dict, verbose: bool) -> Optional[str]:
     """Try all strategies to find a meaningful title for a session."""
     branch = meta.get("branch")
     cwd = meta.get("cwd")
@@ -459,7 +460,7 @@ def resolve_title(meta: dict, repo_cache: dict, title_cache: dict, pr_cache: dic
     return None
 
 
-def _clean_model_title(text: str) -> str | None:
+def _clean_model_title(text: str) -> Optional[str]:
     title = text.strip().split("\n")[0].strip()
     # Drop quotes if the model wrapped the title
     if len(title) >= 2 and title[0] == title[-1] and title[0] in "\"'":
@@ -469,7 +470,7 @@ def _clean_model_title(text: str) -> str | None:
     return None
 
 
-def _title_prompt_from_meta(meta: dict) -> str | None:
+def _title_prompt_from_meta(meta: dict) -> Optional[str]:
     texts = meta.get("allUserTexts") or []
     if not texts:
         return None
@@ -485,7 +486,7 @@ def _title_prompt_from_meta(meta: dict) -> str | None:
     ) + excerpt
 
 
-def generate_title_via_claude(meta: dict, verbose: bool, model: str) -> str | None:
+def generate_title_via_claude(meta: dict, verbose: bool, model: str) -> Optional[str]:
     """Use claude -p to generate a short title from the first few messages."""
     prompt = _title_prompt_from_meta(meta)
     if not prompt:
@@ -509,7 +510,7 @@ def generate_title_via_claude(meta: dict, verbose: bool, model: str) -> str | No
     return None
 
 
-def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> str | None:
+def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> Optional[str]:
     """Use ollama run to generate a short title from the first few messages."""
     prompt = _title_prompt_from_meta(meta)
     if not prompt:
@@ -542,8 +543,8 @@ def main():
     claude_model = DEFAULT_CLAUDE_MODEL
     ollama_model = DEFAULT_OLLAMA_MODEL
     max_age_days = DEFAULT_MAX_AGE_DAYS
-    single_file: Path | None = None
-    force_title: str | None = None
+    single_file: Optional[Path] = None
+    force_title: Optional[str] = None
     if "--title-provider" in sys.argv:
         i = sys.argv.index("--title-provider")
         if i + 1 < len(sys.argv):
@@ -604,7 +605,7 @@ def main():
     skipped_empty = 0
     skipped_old = 0
 
-    def process(session_file: Path, index_data: dict | None = None, index_modified_ref: list | None = None) -> None:
+    def process(session_file: Path, index_data: Optional[dict] = None, index_modified_ref: Optional[list] = None) -> None:
         nonlocal renamed, skipped_has_title, skipped_no_match, skipped_empty
         meta = read_session_metadata(session_file)
         if not meta:
@@ -688,7 +689,7 @@ def main():
                 continue
             index_data = load_sessions_index(project_dir)
             index_modified = False
-            index_modified_ref: list[bool] = [False]
+            index_modified_ref: List[bool] = [False]
             for session_file in sorted(project_dir.glob("*.jsonl")):
                 try:
                     mtime = session_file.stat().st_mtime
