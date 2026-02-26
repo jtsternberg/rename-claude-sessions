@@ -570,7 +570,10 @@ def _load_env_var(name: str) -> Optional[str]:
                         continue
                     k, v = line.split("=", 1)
                     if k.strip() == name:
-                        return v.strip()
+                        v = v.strip()
+                        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                            v = v[1:-1]
+                        return v
         except OSError:
             pass
     return None
@@ -692,6 +695,9 @@ def main():
             if not force_title:
                 print("Usage: rename-claude-sessions --file <path> --force-title \"Your title\"", file=sys.stderr)
                 sys.exit(1)
+    if "--session-id" in sys.argv and "--current" in sys.argv:
+        print("Usage: use only one of --session-id or --current", file=sys.stderr)
+        sys.exit(1)
     if "--session-id" in sys.argv:
         i = sys.argv.index("--session-id")
         sid = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
