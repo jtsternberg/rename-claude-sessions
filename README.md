@@ -6,7 +6,7 @@ It tries strategies in this order:
 1. GitHub URL in early user messages (issue/PR title via `gh`)
 2. Issue/PR inferred from branch name
 3. PR inferred from branch name
-4. LLM fallback (`ollama`, `claude`, or `auto`)
+4. LLM fallback (`gemini`, `ollama`, `claude`, or `auto`)
 
 The script appends a `custom-title` JSONL record and restores file `mtime/atime` so session ordering is preserved. It also updates each project’s `sessions-index.json` so Ctrl+R shows the new title without reopening.
 
@@ -14,8 +14,7 @@ The script appends a `custom-title` JSONL record and restores file `mtime/atime`
 
 - Python 3
 - `gh` CLI (for issue/PR lookups); must be authenticated (e.g. `gh auth login`)
-- `ollama` (if using Ollama fallback)
-- `claude` CLI (if using Claude fallback)
+- One or more LLM providers (optional): `ollama`, `claude` CLI, or Gemini API key in `.env` for `--title-provider gemini`
 
 No pip dependencies — stdlib only, plus the tools above.
 
@@ -97,13 +96,39 @@ python3 rename-claude-sessions.py --cleanup --dry-run   # preview
 python3 rename-claude-sessions.py --cleanup             # run for real
 ```
 
+Rename a specific session by ID, or the current (most recently modified) session:
+
+```bash
+python3 rename-claude-sessions.py --session-id <UUID> --force-title "My session title"
+python3 rename-claude-sessions.py --current --force-title "My session title" --force
+```
+
+Use Gemini for LLM fallback (no local model required):
+
+```bash
+python3 rename-claude-sessions.py --title-provider gemini   # needs GEMINI_API_KEY in .env
+```
+
 Useful flags:
-- `--title-provider ollama|claude|auto`
+- `--title-provider gemini|ollama|claude|auto` (default: `ollama`). `auto` tries gemini → ollama → claude.
+- `--gemini-model <model>` — Gemini model name (default: `gemini-2.5-flash`). Requires `GEMINI_API_KEY` in `.env` next to the script or in the environment.
 - `--ollama-model <model>` — must be one shown by `ollama list`
 - `--claude-model <model>` — must be one of: `haiku`, `sonnet`, or `opus`
 - `--max-age-days <N>` (default: `5`; `0` disables age limit)
 - `--force` — include active sessions (skip the 300s idle check)
 - `--cleanup` — delete sessions with no real user messages and remove them from the index (use `--dry-run` first to preview)
+- `--session-id <UUID>` — find and rename a single session by ID across all project dirs. Use with `--force-title "Title"`. Cannot be combined with `--current`.
+- `--current` — rename the most recently modified session (the active one). Use with `--force-title "Title"`. Cannot be combined with `--session-id`.
+
+### Gemini setup (optional)
+
+To use `--title-provider gemini` or have `auto` try Gemini first:
+
+1. Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey).
+2. Create a `.env` file next to the script (same directory as `rename-claude-sessions.py`):  
+   `GEMINI_API_KEY=your_key_here`  
+   Quoted values are supported, e.g. `GEMINI_API_KEY="key"`.
+3. The `.env` file is gitignored.
 
 ## Cron setup
 
