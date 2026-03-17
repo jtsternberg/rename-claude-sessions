@@ -68,6 +68,33 @@ _monorepo_cache: Dict[str, bool] = {}
 # Track consecutive Gemini failures to bail early on rate limits
 _gemini_consecutive_failures = 0
 GEMINI_MAX_CONSECUTIVE_FAILURES = 3
+# Track tool errors separately from "no match"
+_tool_errors: Dict[str, int] = {}
+
+
+def _log_tool_error(tool: str, error: str) -> None:
+    """Always log tool errors (not gated on --verbose) and count them."""
+    _tool_errors[tool] = _tool_errors.get(tool, 0) + 1
+    # Only print the first occurrence per tool to avoid log spam
+    if _tool_errors[tool] == 1:
+        print(f"  WARNING: {tool}: {error}", file=sys.stderr)
+
+
+def check_tools_in_path(title_provider: str, verbose: bool) -> None:
+    """Verify required CLI tools are available before processing sessions."""
+    import shutil
+    missing = []
+    if not shutil.which("gh"):
+        missing.append("gh (GitHub CLI) — needed for issue/PR/branch title strategies")
+    if title_provider in ("ollama", "auto") and not shutil.which("ollama"):
+        missing.append("ollama — needed for LLM title generation")
+    if title_provider in ("claude", "auto") and not shutil.which("claude"):
+        missing.append("claude — needed for LLM title generation")
+    if missing:
+        print("WARNING: tools not found in PATH:", file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        print(f"  PATH={os.environ.get('PATH', '(unset)')}", file=sys.stderr)
 
 # Regex for GitHub issue/PR URLs
 GH_URL_RE = re.compile(
@@ -143,8 +170,12 @@ def run_gh(args: List[str], cwd: Optional[str] = None, timeout: int = 15) -> Opt
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
+    except FileNotFoundError:
+        _log_tool_error("gh", "not found in PATH")
+    except subprocess.TimeoutExpired:
+        _log_tool_error("gh", f"timed out: gh {' '.join(args[:3])}")
+    except OSError as e:
+        _log_tool_error("gh", str(e))
     return None
 
 
@@ -525,9 +556,12 @@ def generate_title_via_claude(meta: dict, verbose: bool, model: str) -> Optional
                 print(f"    (claude: {result.stderr.strip()[:200]})")
             return None
         return _clean_model_title(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        if verbose:
-            print(f"    (claude: {e})")
+    except FileNotFoundError:
+        _log_tool_error("claude", "not found in PATH")
+    except subprocess.TimeoutExpired:
+        _log_tool_error("claude", f"timed out after {TITLE_TIMEOUT}s")
+    except OSError as e:
+        _log_tool_error("claude", str(e))
     return None
 
 
@@ -549,9 +583,12 @@ def generate_title_via_ollama(meta: dict, verbose: bool, model: str) -> Optional
                 print(f"    (ollama: {result.stderr.strip()[:200]})")
             return None
         return _clean_model_title(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        if verbose:
-            print(f"    (ollama: {e})")
+    except FileNotFoundError:
+        _log_tool_error("ollama", "not found in PATH")
+    except subprocess.TimeoutExpired:
+        _log_tool_error("ollama", f"timed out after {TITLE_TIMEOUT}s")
+    except OSError as e:
+        _log_tool_error("ollama", str(e))
     return None
 
 
@@ -745,6 +782,8 @@ def main():
         print(f"No Claude projects directory at {CLAUDE_PROJECTS_DIR}")
         return
 
+    check_tools_in_path(title_provider, verbose)
+
     repo_cache: dict = {}
     title_cache: dict = {}
     pr_cache: dict = {}
@@ -894,6 +933,7 @@ def main():
                     print(f"  WARNING: Failed to update sessions-index.json in {project_dir.name}", file=sys.stderr)
 
     action = "Would rename" if dry_run else "Renamed"
+    total_tool_errors = sum(_tool_errors.values())
     parts = [
         f"{action}: {renamed}",
         f"Already titled: {skipped_has_title}",
@@ -901,10 +941,15 @@ def main():
         f"Empty: {skipped_empty}",
         f"Too old: {skipped_old}",
     ]
+    if total_tool_errors:
+        parts.append(f"Tool errors: {total_tool_errors}")
     if cleanup:
         clean_action = "Would delete" if dry_run else "Deleted"
         parts.append(f"{clean_action}: {cleaned}")
     print(f"\n{' | '.join(parts)}")
+    if _tool_errors:
+        for tool, count in _tool_errors.items():
+            print(f"  WARNING: {tool} failed {count} time(s)", file=sys.stderr)
 
 
 if __name__ == "__main__":
